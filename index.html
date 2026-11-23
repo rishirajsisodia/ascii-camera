@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII Cam</title>
+<style>
+  :root { --bg:#0b0f0b; --panel:#141a14; --border:#2a352a; --fg:#cfe8cf; --ascii:#33ff66; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; background:#050705; color:var(--fg);
+         font-family: ui-monospace, Menlo, Consolas, monospace; display:flex;
+         align-items:center; justify-content:center; padding:16px; }
+  .term { width:min(1000px,100%); background:var(--bg); border:1px solid var(--border);
+          border-radius:10px; overflow:hidden; box-shadow:0 10px 40px #000a; }
+  .bar { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--panel);
+         border-bottom:1px solid var(--border); font-size:13px; }
+  .dot { width:12px; height:12px; border-radius:50%; }
+  .r{background:#ff5f57}.y{background:#febc2e}.g{background:#28c840}
+  .bar .title { margin-left:8px; opacity:.7 }
+  .controls { display:flex; flex-wrap:wrap; gap:12px 18px; padding:10px 12px;
+              border-bottom:1px solid var(--border); font-size:13px; align-items:center; }
+  .controls label { display:flex; align-items:center; gap:6px; }
+  select, input, button { background:#0b0f0b; color:var(--fg); border:1px solid var(--border);
+          border-radius:4px; padding:4px 6px; font:inherit; }
+  input[type=color] { padding:0; width:32px; height:24px; cursor:pointer; }
+  input[type=range] { padding:0; }
+  input[type=text] { width:140px }
+  button { cursor:pointer } button:hover { border-color:var(--ascii) }
+  .screen { padding:12px; display:flex; justify-content:center; min-height:300px; position:relative; }
+  pre#out { margin:0; color:var(--ascii); line-height:1; letter-spacing:0; white-space:pre;
+            font-family: ui-monospace, Menlo, Consolas, monospace; }
+  pre#out.colored { color:inherit }
+  #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+         text-align:center; padding:24px; color:#ffb86b; white-space:pre-wrap; pointer-events:none; }
+  #msg:empty { display:none }
+  #note { padding:6px 12px; font-size:12px; color:#ffb86b; border-top:1px solid var(--border); }
+  #note:empty { display:none }
+  canvas { display:none }
+  .stage { position:relative; }
+  .stage video { position:absolute; inset:0; width:100%; height:100%; object-fit:fill; opacity:0; }
+  .stage.framed video { opacity:1; }
+  #frameBox { position:absolute; display:none; border:2px solid var(--ascii); box-shadow:0 0 12px var(--ascii);
+              background:var(--bg); pointer-events:none; z-index:0; }   /* opaque: hides the camera video inside the frame */
+  pre#out { position:relative; z-index:1; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+<div class="term">
+  <div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span class="title">ascii-cam — ~/live</span></div>
+  <div class="controls">
+    <label>Camera <select id="cam"></select></label>
+    <label>Color <input type="color" id="color" value="#33ff66"></label>
+    <label>Charset <select id="chars">
+      <option value=" .:-=+*#%@">Classic</option>
+      <option value=" .'`^&quot;,:;Il!i&gt;&lt;~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&amp;8%B@$">Detailed</option>
+      <option value=" .oO0@">Simple</option>
+      <option value=" ░▒▓█">Blocks</option>
+    </select></label>
+    <label>Width <input type="range" id="cols" min="40" max="200" value="110"><span id="colsv">110</span></label>
+    <label title="Pinch thumb+index on both hands; the two pinch points become opposite corners of a frame">
+      <input type="checkbox" id="hand" checked> Hand frame (pinch both hands)</label>
+    <label><input type="checkbox" id="mirror" checked> Mirror</label>
+    <label><input type="checkbox" id="rev"> Invert</label>
+    <label><input type="checkbox" id="rgb"> Use camera colors</label>
+    <button id="snap">Save .txt</button>
+  </div>
+  <div class="screen" id="screen">
+    <div class="stage" id="stage">
+      <video id="v" playsinline muted></video>
+      <pre id="out"></pre>
+      <div id="frameBox"></div>
+    </div>
+    <div id="msg">Requesting camera access…</div>
+  </div>
+  <div id="note"></div>
+</div>
+<canvas id="c"></canvas>
+
+<script>
+const $ = id => document.getElementById(id);
+const v = $('v'), c = $('c'), ctx = c.getContext('2d', { willReadFrequently: true });
+const out = $('out'), msg = $('msg'), camSel = $('cam');
+let stream = null, lastText = '';
+
+function show(t) { msg.textContent = t || ''; }
+const note = t => { $('note').textContent = t || ''; };
+
+// ---- hand tracking (MediaPipe Hands): pinch with both hands -> frame rectangle ----
+let hands = null, handBusy = false, targetRect = null, rect = null, lastSeen = 0;
+function initHands() {
+  if (hands) return true;
+  if (!window.Hands) { note('Hand tracking model could not be loaded (needs internet).'); $('hand').checked = false; return false; }
+  hands = new Hands({ locateFile: f =>
+    'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/' + f });
+  hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+  hands.onResults(r => {
+    const W = v.videoWidth, H = v.videoHeight, mir = $('mirror').checked, pts = [];
+    for (const lm of r.multiHandLandmarks || []) {
+      const dist = (a, b) => Math.hypot((a.x - b.x) * W, (a.y - b.y) * H);
+      if (dist(lm[4], lm[8]) < 0.4 * dist(lm[0], lm[9]))          // thumb tip ~ index tip => pinch
+        pts.push({ x: mir ? 1 - (lm[4].x + lm[8].x) / 2 : (lm[4].x + lm[8].x) / 2, y: (lm[4].y + lm[8].y) / 2 });
+    }
+    if (pts.length === 2) {
+      targetRect = { x0: Math.min(pts[0].x, pts[1].x), x1: Math.max(pts[0].x, pts[1].x),
+                     y0: Math.min(pts[0].y, pts[1].y), y1: Math.max(pts[0].y, pts[1].y) };
+      lastSeen = performance.now();
+    }
+  });
+  return true;
+}
+function updateRect() {
+  if (!targetRect || performance.now() - lastSeen > 250) { targetRect = null; rect = null; return; }
+  if (!rect) rect = { ...targetRect };
+  for (const k in rect) rect[k] += (targetRect[k] - rect[k]) * 0.5;     // smooth jitter
+}
+
+async function listCams() {
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const cur = camSel.value;
+  camSel.innerHTML = '';
+  devs.forEach((d, i) => camSel.add(new Option(d.label || 'Camera ' + (i + 1), d.deviceId)));
+  if (cur) camSel.value = cur;
+}
+
+async function start(deviceId) {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    show('Camera API unavailable. Open this page via http://localhost or https://, not file://.');
+    return;
+  }
+  stream?.getTracks().forEach(t => t.stop());
+  show('Requesting camera access…');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: deviceId ? { deviceId: { exact: deviceId } } : true, audio: false });
+    v.srcObject = stream; await v.play();
+    await listCams();                       // labels are available only after permission
+    camSel.value = stream.getVideoTracks()[0].getSettings().deviceId || camSel.value;
+    show('');
+  } catch (e) {
+    show(e.name === 'NotAllowedError' ? 'Camera permission denied. Allow it in the browser address bar and reload.'
+       : e.name === 'NotFoundError' ? 'No camera found.'
+       : e.name === 'NotReadableError' ? 'Camera is in use by another app.'
+       : 'Camera error: ' + e.message);
+  }
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  if (!stream || v.readyState < 2 || !v.videoWidth) return;
+  const cols = +$('cols').value;
+  const rows = Math.max(1, Math.round(cols * (v.videoHeight / v.videoWidth) * 0.6)); // glyph is ~0.6em wide, 1em tall
+  if (c.width !== cols || c.height !== rows) { c.width = cols; c.height = rows; }
+  ctx.save();
+  if ($('mirror').checked) { ctx.translate(cols, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(v, 0, 0, cols, rows);
+  ctx.restore();
+  const d = ctx.getImageData(0, 0, cols, rows).data;
+
+  const handOn = $('hand').checked && initHands();
+  if (handOn && !handBusy) { handBusy = true; hands.send({ image: v }).catch(() => {}).finally(() => handBusy = false); }
+  if (handOn) updateRect(); else rect = null;
+  $('stage').classList.toggle('framed', handOn);
+  v.style.transform = $('mirror').checked ? 'scaleX(-1)' : 'none';
+  const fb = $('frameBox');
+  fb.style.display = rect ? 'block' : 'none';
+  if (rect) Object.assign(fb.style, { left: rect.x0 * 100 + '%', top: rect.y0 * 100 + '%',
+    width: (rect.x1 - rect.x0) * 100 + '%', height: (rect.y1 - rect.y0) * 100 + '%' });
+
+
+  const G = [...$('chars').value], rgb = $('rgb').checked;
+  let text = '', html = '';
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const p = y * cols + x, i = p * 4, r = d[i], g = d[i+1], b = d[i+2];
+      let ch = ' ';
+            const cx = (x + 0.5) / cols, cy = (y + 0.5) / rows;
+      const inFrame = !handOn || (rect && cx >= rect.x0 && cx <= rect.x1 && cy >= rect.y0 && cy <= rect.y1);
+      if (inFrame) {
+        let l = (0.299*r + 0.587*g + 0.114*b) / 255;
+        l = Math.max(0, Math.min(1, (l - 0.15) / 0.65));          // stretch contrast so features stand out
+        if ($('rev').checked) l = 1 - l;
+        ch = G[Math.round(l * (G.length - 1))];                     // dark -> light ramp
+      }
+      text += ch;
+      if (rgb) html += ch === ' ' ? ' ' : `<span style="color:rgb(${r},${g},${b})">${ch}</span>`;
+    }
+    text += '\n'; if (rgb) html += '\n';
+  }
+  lastText = text;
+  out.classList.toggle('colored', rgb);
+  if (rgb) out.innerHTML = html; else out.textContent = text;
+  // fit text to container width (monospace glyph ≈ 0.6em wide)
+  const w = $('screen').clientWidth - 24;
+  out.style.fontSize = Math.max(3, Math.min(14, w / (cols * 0.6))) + 'px';
+}
+
+$('color').oninput = e => document.documentElement.style.setProperty('--ascii', e.target.value);
+$('cols').oninput = e => $('colsv').textContent = e.target.value;
+camSel.onchange = () => start(camSel.value);
+$('snap').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([lastText], { type: 'text/plain' }));
+  a.download = 'ascii-' + Date.now() + '.txt'; a.click();
+};
+navigator.mediaDevices?.addEventListener?.('devicechange', listCams);
+start(); frame();
+</script>
+</body>
+</html>
